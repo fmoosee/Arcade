@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ESP32 Arcade Station</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="lobby-screen" class="screen active">
+        <div class="top-bar">
+            <h1 class="neon-text">ARCADE</h1>
+            <button onclick="openSettings()" class="settings-btn">⚙️</button>
+        </div>
+        
+        <div class="status-panel">
+            <div class="status-item">🔋 <span id="bat-val">--</span>%</div>
+            <div class="status-item">🟢 <span id="players-val">0</span> Online</div>
+        </div>
+        
+        <div class="game-grid">
+            <button class="game-btn" onclick="startGame('pingpong')">
+                <span class="icon">🏓</span>
+                <span class="name">Ping Pong</span>
+                <span class="info">2 Jogadores</span>
+            </button>
+            <button class="game-btn" onclick="startGame('meteoro')">
+                <span class="icon">☄️</span>
+                <span class="name">Meteoro</span>
+                <span class="info">3 Jogadores</span>
+            </button>
+            <button class="game-btn" onclick="startGame('galaga')">
+                <span class="icon">🚀</span>
+                <span class="name">Galaga</span>
+                <span class="info">2 Jogadores</span>
+            </button>
+            <button class="game-btn" onclick="startGame('flappy')">
+                <span class="icon">🐦</span>
+                <span class="name">Flappy</span>
+                <span class="info">5 Jogadores</span>
+            </button>
+        </div>
+        
+        <div id="connection-status" class="blink">Conectando ao Servidor...</div>
+    </div>
+
+    <div id="settings-modal" class="modal hidden">
+        <div class="modal-content">
+            <button class="btn-tiny close-x" onclick="closeSettings()">✖</button>
+            <h2>Configurações WiFi</h2>
+            
+            <div class="option-row">
+                <label>Modo Offline (Apenas AP)</label>
+                <input type="checkbox" id="ap-mode-toggle" onchange="toggleApMode()">
+            </div>
+
+            <hr style="border-color:#444; margin: 15px 0;">
+
+            <h3>Redes Disponíveis</h3>
+            <button class="btn-action" onclick="startScan()" style="width:100%; margin-bottom:10px;">🔍 Escanear Redes</button>
+            
+            <div id="scan-loading" class="hidden" style="text-align:center; color:#aaa; margin:10px;">
+                Procurando redes... aguarde.
+            </div>
+            
+            <ul id="scan-list" class="network-list">
+                <li style="color:#666; text-align:center; padding:10px;">Nenhum scan realizado</li>
+            </ul>
+            
+            <hr style="border-color:#444; margin: 15px 0;">
+
+            <h3>Salvar Rede Manual</h3>
+            <input type="text" id="new-ssid" placeholder="Nome da Rede (SSID)">
+            <input type="password" id="new-pass" placeholder="Senha (Deixe vazio se aberta)">
+            <button class="btn-action" onclick="addNetwork()">💾 Salvar Rede</button>
+            
+            <h3>Redes Já Salvas</h3>
+            <ul id="network-list" class="network-list"></ul>
+            
+            <button class="btn-small close-btn" onclick="closeSettings()">Fechar Configurações</button>
+        </div>
+    </div>
+
+    <div id="game-screen" class="screen">
+        <div class="header-game">
+            <button class="btn-small" onclick="exitGame()">🔙 Sair</button>
+            <span id="game-title">JOGO</span>
+            <button class="btn-small" onclick="sendPause()">⏸️</button>
+        </div>
+        
+        <div class="canvas-container">
+            <canvas id="gameCanvas"></canvas>
+        </div>
+
+        <div id="pause-overlay" class="overlay hidden">
+            <h2>JOGO PAUSADO</h2>
+            <p>Aguardando jogadores ou comando...</p>
+            <button class="btn-action" onclick="sendReset()">REINICIAR PARTIDA</button>
+        </div>
+    </div>
+
+    <script src="game.js"></script>
+
+    <script>
+        // ===========================================
+        // LÓGICA DE INTERFACE (UI)
+        // ===========================================
+
+        function openSettings() {
+            document.getElementById('settings-modal').classList.remove('hidden');
+            loadNetworks(); // Carrega redes salvas
+            // Verifica status atual (se está em modo AP)
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(d => {
+                    document.getElementById('ap-mode-toggle').checked = d.apMode;
+                })
+                .catch(e => console.log("Erro ao ler status"));
+        }
+
+        function closeSettings() {
+            document.getElementById('settings-modal').classList.add('hidden');
+        }
+
+        // ===========================================
+        // LÓGICA DE SCANNER WIFI
+        // ===========================================
+
+        function startScan() {
+            // Limpa lista e mostra loading
+            document.getElementById('scan-list').innerHTML = "";
+            document.getElementById('scan-loading').classList.remove('hidden');
+            
+            // Solicita inicio do scan
+            fetch('/api/scan')
+                .then(() => {
+                    // Começa a verificar o resultado a cada 1.5s
+                    setTimeout(pollScanResults, 1500);
+                })
+                .catch(() => alert("Erro ao iniciar Scan"));
+        }
+
+        function pollScanResults() {
+            fetch('/api/scan_results').then(r => {
+                if(r.status === 202) {
+                    // Código 202 significa "Ainda processando"
+                    setTimeout(pollScanResults, 1000);
+                } else {
+                    // Scan terminou, renderiza
+                    r.json().then(data => renderScanList(data));
+                }
+            });
+        }
+
+        function renderScanList(networks) {
+            document.getElementById('scan-loading').classList.add('hidden');
+            const ul = document.getElementById('scan-list');
+            ul.innerHTML = "";
+            
+            if(networks.length === 0) {
+                ul.innerHTML = "<li style='color:#777; padding:10px;'>Nenhuma rede encontrada</li>";
+                return;
+            }
+
+            // Ordena redes por sinal (RSSI)
+            networks.sort((a,b) => b.rssi - a.rssi);
+
+            networks.forEach(net => {
+                const li = document.createElement('li');
+                li.className = "scan-item";
+                
+                // Ícones e cores baseados na segurança e sinal
+                const lockIcon = net.open ? "🔓" : "🔒";
+                const signalColor = net.rssi > -60 ? "#0f0" : (net.rssi > -80 ? "#ff0" : "#f00");
+                
+                li.innerHTML = `
+                    <div style="display:flex; align-items:center;">
+                        <span style="margin-right:10px; font-size:1.2em;">${lockIcon}</span>
+                        <strong>${net.ssid}</strong>
+                    </div>
+                    <span style="color:${signalColor}; font-size:0.8em;">${net.rssi}dBm</span>
+                `;
+                
+                // Evento de clique para selecionar
+                li.onclick = () => selectScannedNetwork(net);
+                ul.appendChild(li);
+            });
+        }
+
+        function selectScannedNetwork(net) {
+            // Preenche o campo de SSID
+            document.getElementById('new-ssid').value = net.ssid;
+            
+            if(net.open) {
+                // Se for rede aberta, pergunta se quer conectar direto
+                if(confirm(`A rede "${net.ssid}" é aberta. Deseja salvar e conectar agora?`)) {
+                    document.getElementById('new-pass').value = "";
+                    addNetwork(true); // true = conectar automaticamente
+                }
+            } else {
+                // Se tiver senha, foca no campo de senha
+                alert(`Rede "${net.ssid}" selecionada.\nPor favor, digite a senha no campo abaixo e clique em Salvar.`);
+                const passInput = document.getElementById('new-pass');
+                passInput.value = "";
+                passInput.focus();
+                passInput.scrollIntoView({behavior: "smooth"});
+            }
+        }
+
+        // ===========================================
+        // GERENCIAMENTO DE REDES (CRUD)
+        // ===========================================
+
+        function loadNetworks() {
+            fetch('/api/networks')
+                .then(r => r.json())
+                .then(list => {
+                    const ul = document.getElementById('network-list');
+                    ul.innerHTML = "";
+                    if(list.length === 0) {
+                        ul.innerHTML = "<li style='color:#666'>Nenhuma rede salva</li>";
+                        return;
+                    }
+                    list.forEach(net => {
+                        const li = document.createElement('li');
+                        li.style.background = "#333";
+                        li.style.marginBottom = "5px";
+                        li.style.padding = "8px";
+                        li.style.borderRadius = "4px";
+                        li.style.display = "flex";
+                        li.style.justifyContent = "space-between";
+                        
+                        li.innerHTML = `
+                            <span>${net.ssid}</span>
+                            <div>
+                                <button onclick="connectNet('${net.ssid}')" class="btn-tiny">Conectar</button>
+                                <button onclick="delNet('${net.ssid}')" class="btn-tiny red">X</button>
+                            </div>`;
+                        ul.appendChild(li);
+                    });
+                });
+        }
+
+        function addNetwork(autoConnect = false) {
+            const ssid = document.getElementById('new-ssid').value;
+            const pass = document.getElementById('new-pass').value;
+            
+            if(!ssid) return alert("Por favor, digite ou selecione um SSID.");
+            
+            fetch('/api/add_network', {
+                method: 'POST',
+                body: JSON.stringify({ssid, pass})
+            }).then(() => {
+                loadNetworks(); // Atualiza a lista visual
+                if(autoConnect) {
+                    connectNet(ssid);
+                } else {
+                    // Limpa os campos se não for autoconnect
+                    document.getElementById('new-ssid').value = "";
+                    document.getElementById('new-pass').value = "";
+                    if(!autoConnect) alert("Rede salva com sucesso!");
+                }
+            });
+        }
+
+        function delNet(ssid) {
+            if(!confirm("Tem certeza que deseja esquecer a rede " + ssid + "?")) return;
+            fetch('/api/delete_network', {
+                method: 'POST', 
+                body: JSON.stringify({ssid})
+            }).then(() => loadNetworks());
+        }
+
+        function connectNet(ssid) {
+            if(!confirm(`O sistema tentará conectar em "${ssid}".\nIsso pode desconectar o WiFi atual momentaneamente.`)) return;
+            
+            fetch('/api/settings', {
+                method: 'POST', 
+                body: JSON.stringify({connectSSID: ssid})
+            }).then(r => alert("Comando enviado. O Arcade está reiniciando a conexão..."));
+        }
+
+        function toggleApMode() {
+            const isAp = document.getElementById('ap-mode-toggle').checked;
+            const msg = isAp ? 
+                "Entrando em Modo Offline (Apenas AP).\nO WiFi será desligado para economizar bateria." : 
+                "Saindo do Modo Offline.\nO sistema tentará conectar na última rede.";
+                
+            if(confirm(msg)) {
+                fetch('/api/settings', {
+                    method: 'POST', 
+                    body: JSON.stringify({apOnly: isAp})
+                }).then(r => alert("Configuração alterada."));
+            } else {
+                // Reverte o checkbox se cancelar
+                document.getElementById('ap-mode-toggle').checked = !isAp;
+            }
+        }
+    </script>
+</body>
+</html>
