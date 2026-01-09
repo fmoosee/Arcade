@@ -1,10 +1,56 @@
 // --- SISTEMA CENTRAL ---
-const ws = new WebSocket(`ws://${window.location.hostname}/ws`);
+// [CHANGE] Encapsulamento da conexão para permitir reconectar
+let ws;
 let myId = null;
 let currentGame = null;
 let isPaused = false;
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
+
+function connectWs() {
+    ws = new WebSocket(`ws://${window.location.hostname}/ws`);
+    
+    ws.onopen = () => {
+        document.getElementById('connection-status').innerText = "🟢 Conectado";
+        ws.send(JSON.stringify({type: "join"}));
+    };
+
+    ws.onclose = () => {
+        document.getElementById('connection-status').innerText = "🔴 Desconectado. Tentando reconectar...";
+        // [CHANGE] Tenta reconectar em 2 segundos
+        setTimeout(connectWs, 2000); 
+    };
+
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        
+        if (msg.type === 'welcome') {
+            myId = msg.id;
+            document.getElementById('bat-val').innerText = msg.bat;
+        } 
+        else if (msg.type === 'battery') {
+            document.getElementById('bat-val').innerText = msg.val;
+        }
+        else if (msg.type === 'players') {
+            document.getElementById('players-val').innerText = msg.count;
+        }
+        else if (msg.type === 'pause') {
+            isPaused = true;
+            document.getElementById('pause-overlay').classList.remove('hidden');
+        }
+        else if (msg.type === 'reset') {
+            isPaused = false;
+            document.getElementById('pause-overlay').classList.add('hidden');
+            if (currentGame) currentGame.reset();
+        }
+        else if (currentGame) {
+            currentGame.handleNetworkMessage(msg);
+        }
+    };
+}
+
+// Inicia conexão
+connectWs();
 
 // Ajusta Canvas
 function resizeCanvas() {
@@ -14,40 +60,6 @@ function resizeCanvas() {
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
 
-// --- WEBSOCKET ---
-ws.onopen = () => {
-    document.getElementById('connection-status').innerText = "🟢 Conectado";
-    ws.send(JSON.stringify({type: "join"}));
-};
-
-ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    
-    if (msg.type === 'welcome') {
-        myId = msg.id;
-        document.getElementById('bat-val').innerText = msg.bat;
-    } 
-    else if (msg.type === 'battery') {
-        document.getElementById('bat-val').innerText = msg.val;
-    }
-    else if (msg.type === 'players') {
-        document.getElementById('players-val').innerText = msg.count;
-    }
-    else if (msg.type === 'pause') {
-        isPaused = true;
-        document.getElementById('pause-overlay').classList.remove('hidden');
-    }
-    else if (msg.type === 'reset') {
-        isPaused = false;
-        document.getElementById('pause-overlay').classList.add('hidden');
-        if (currentGame) currentGame.reset();
-    }
-    else if (currentGame) {
-        // Passa mensagem para o jogo atual lidar (ex: movimento do oponente)
-        currentGame.handleNetworkMessage(msg);
-    }
-};
-
 // --- CONTROLES GERAIS ---
 function startGame(gameName) {
     document.getElementById('lobby-screen').classList.remove('active');
@@ -55,7 +67,6 @@ function startGame(gameName) {
     
     if (gameName === 'pingpong') currentGame = new PingPong();
     else if (gameName === 'meteoro') currentGame = new Meteoro();
-    // Adicionar outros...
     
     gameLoop();
 }
@@ -66,13 +77,8 @@ function exitGame() {
     document.getElementById('lobby-screen').classList.add('active');
 }
 
-function sendPause() {
-    ws.send(JSON.stringify({type: "pause"})); // Envia comando de pausa para todos
-}
-
-function sendReset() {
-    ws.send(JSON.stringify({type: "reset"})); // Reseta para todos
-}
+function sendPause() { ws.send(JSON.stringify({type: "pause"})); }
+function sendReset() { ws.send(JSON.stringify({type: "reset"})); }
 
 // --- GAME LOOP ---
 function gameLoop() {
@@ -86,63 +92,65 @@ function gameLoop() {
     requestAnimationFrame(gameLoop);
 }
 
+// [CHANGE] Função auxiliar de Interpolação Linear (Suavização)
+// O valor vai de 'start' para 'end' em passos de 'amt' (0.0 a 1.0)
+function lerp(start, end, amt) {
+    return (1 - amt) * start + amt * end;
+}
+
 // ==========================================================
-// === JOGO 1: PING PONG (Lógica Cliente)
+// === JOGO 1: PING PONG
 // ==========================================================
 class PingPong {
     constructor() {
         this.paddleW = 80;
         this.paddleH = 10;
-        // Eu sou Player 1 (Bottom) ou Player 2 (Top)?
-        // Lógica simples: IDs pares são P1, ímpares P2 (pode melhorar depois)
         this.isP1 = (myId % 2) === 0; 
         
         this.x = canvas.width / 2 - this.paddleW / 2;
+        
+        // [CHANGE] targetRemoteX guarda onde o inimigo quer ir
+        // remoteX é onde ele está sendo desenhado agora (suavizado)
         this.remoteX = canvas.width / 2 - this.paddleW / 2;
+        this.targetRemoteX = this.remoteX;
         
         this.ball = {x: 100, y: 100, vx: 2, vy: 2, r: 5};
         
-        // Controles de Toque
         canvas.addEventListener('touchmove', (e) => {
             e.preventDefault();
             const touch = e.touches[0];
             const rect = canvas.getBoundingClientRect();
             this.x = touch.clientX - rect.left - this.paddleW/2;
-            
-            // Envia minha posição para o servidor
             ws.send(JSON.stringify({type: "move", x: this.x}));
         }, {passive: false});
     }
 
     handleNetworkMessage(msg) {
         if (msg.type === "move" && msg.id !== myId) {
-            // Atualiza posição do oponente
-            this.remoteX = msg.x; 
+            // [CHANGE] Não teleportamos, apenas definimos o alvo
+            this.targetRemoteX = msg.x; 
         }
     }
 
     update() {
-        // Física da bola (Simplificada - roda localmente em cada celular)
-        // O ideal é um "Host" decidir, mas para LAN WiFi funciona bem assim
+        // [CHANGE] Suaviza o movimento do oponente (0.2 = 20% do caminho por frame)
+        // Isso remove o efeito "travado" se a rede oscilar.
+        this.remoteX = lerp(this.remoteX, this.targetRemoteX, 0.2);
+
         this.ball.x += this.ball.vx;
         this.ball.y += this.ball.vy;
 
-        // Colisões parede
         if (this.ball.x < 0 || this.ball.x > canvas.width) this.ball.vx *= -1;
         if (this.ball.y < 0 || this.ball.y > canvas.height) this.ball.vy *= -1;
-
-        // Colisões raquete (Minha e Oponente)
-        // ... (Adicionar lógica de colisão básica aqui)
     }
 
     draw() {
-        // Desenha Minha Raquete (Verde)
+        // Player
         ctx.fillStyle = "#0f0";
         ctx.fillRect(this.x, canvas.height - 20, this.paddleW, this.paddleH);
         
-        // Desenha Oponente (Vermelho - topo)
+        // Oponente
         ctx.fillStyle = "#f00";
-        // Inverte o X do oponente para espelhar a tela
         ctx.fillRect(canvas.width - this.remoteX - this.paddleW, 10, this.paddleW, this.paddleH);
         
         // Bola
@@ -157,13 +165,8 @@ class PingPong {
     }
 }
 
-// ==========================================================
-// === JOGO 2: METEORO (Placeholder)
-// ==========================================================
 class Meteoro {
-    constructor() {
-        this.shipX = canvas.width / 2;
-    }
+    constructor() {}
     handleNetworkMessage(msg) {}
     update() {}
     draw() {
@@ -173,5 +176,3 @@ class Meteoro {
     }
     reset() {}
 }
-
-// Para Galaga e Flappy Bird, siga a estrutura da classe 'Meteoro'
